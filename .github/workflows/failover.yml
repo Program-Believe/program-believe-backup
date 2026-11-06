@@ -1,0 +1,80 @@
+name: Automatic failover
+
+# Every 5 minutes: check the main site. If it is down, point program-believe.org
+# at this backup site. When it is healthy again, point the domain back to Base44.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: failover
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  HEALTH_URL: https://program-believe.base44.app/
+  DOMAIN: program-believe.org
+  WWW: www.program-believe.org
+  APEX_ORIGINAL_TYPE: A
+  APEX_ORIGINAL_VALUE: 216.24.57.1
+  WWW_ORIGINAL_TYPE: CNAME
+  WWW_ORIGINAL_VALUE: base44.onrender.com
+  BACKUP_TARGET: program-believe.github.io
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check main site (3 tries, 60s apart)
+        id: health
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$HEALTH_URL" || echo 000)
+            echo "Try $i: $code"
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then ok=$((ok+1)); fi
+            if [ $i -lt 3 ]; then sleep 60; fi
+          done
+          if [ $ok -eq 0 ]; then echo "state=down" >> $GITHUB_OUTPUT
+          elif [ $ok -eq 3 ]; then echo "state=up" >> $GITHUB_OUTPUT
+          else echo "state=unsure" >> $GITHUB_OUTPUT; fi
+
+      - name: Switch DNS if needed
+        if: steps.health.outputs.state != 'unsure'
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          STATE: ${{ steps.health.outputs.state }}
+        run: |
+          if [ -z "$CF_TOKEN" ] || [ -z "$CF_ZONE" ]; then echo "Cloudflare secrets not set yet - skipping."; exit 0; fi
+          api="https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records"
+
+          # set_record NAME TYPE CONTENT PROXIED -> returns 0 if it changed something
+          set_record () {
+            rec=$(curl -s -H "Authorization: Bearer $CF_TOKEN" "$api?name=$1" | jq -c '[.result[] | select(.type=="A" or .type=="CNAME" or .type=="AAAA")][0]')
+            id=$(echo "$rec" | jq -r '.id'); current=$(echo "$rec" | jq -r '.content')
+            if [ "$current" = "$3" ]; then echo "$1 already -> $3"; return 1; fi
+            curl -s -X PUT -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$api/$id" \
+              --data "{\"type\":\"$2\",\"name\":\"$1\",\"content\":\"$3\",\"proxied\":$4,\"ttl\":1}" | jq -c '{success, errors}'
+            return 0
+          }
+
+          git config user.name "failover-bot"
+          git config user.email "failover-bot@users.noreply.github.com"
+
+          if [ "$STATE" = "down" ]; then
+            echo "Main site DOWN - switching to backup"
+            if [ ! -f CNAME ]; then echo "$DOMAIN" > CNAME; git add CNAME; git commit -m "Failover: serve backup on $DOMAIN"; git push; fi
+            set_record "$DOMAIN" CNAME "$BACKUP_TARGET" true || true
+            set_record "$WWW" CNAME "$BACKUP_TARGET" true || true
+          else
+            set_record "$DOMAIN" "$APEX_ORIGINAL_TYPE" "$APEX_ORIGINAL_VALUE" false || true
+            set_record "$WWW" "$WWW_ORIGINAL_TYPE" "$WWW_ORIGINAL_VALUE" false || true
+            if [ -f CNAME ]; then git rm -q CNAME; git commit -m "Recovered: main site back on $DOMAIN"; git push; fi
+            echo "Main site is up"
+          fi
